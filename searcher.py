@@ -1,0 +1,150 @@
+"""Chess engine search implementation."""
+from collections import namedtuple, defaultdict
+import time
+
+from .tuning import MATE_UPPER, MATE_LOWER, QS, QS_A, EVAL_ROUGHNESS
+
+# Score bounds for transposition table
+Entry = namedtuple("Entry", "lower upper")
+
+class Searcher:
+    def __init__(self):
+        self.tp_score = {}  # transposition table for scores
+        self.tp_move = {}   # transposition table for moves
+        self.history = set() # avoid loops
+        self.nodes = 0      # count visited nodes
+
+    def bound(self, pos, gamma, depth, can_null=True):
+        """ Let s* be the "true" score of the sub-tree we are searching.
+            The method returns r, where
+            if gamma >  s* then s* <= r < gamma  (A better upper bound)
+            if gamma <= s* then gamma <= r <= s* (A better lower bound) """
+        self.nodes += 1
+
+        # Depth <= 0 is QSearch. Here any position is searched as deeply as is needed for
+        # calmness, and from this point on there is no difference in behaviour depending on
+        # depth, so so there is no reason to keep different depths in the transposition table.
+        depth = max(depth, 0)
+
+        # Sunfish is a king-capture engine, so we should always check if we
+        # still have a king. Notice since this is the only termination check,
+        # the remaining code has to be comfortable with being mated, stalemated
+        # or able to capture the opponent king.
+        if pos.score <= -MATE_LOWER:
+            return -MATE_UPPER
+
+        # Look in the table if we have already searched this position before.
+        # We also need to be sure, that the stored search was over the same
+        # nodes as the current search.
+        entry = self.tp_score.get((pos, depth, can_null), Entry(-MATE_UPPER, MATE_UPPER))
+        if entry.lower >= gamma: return entry.lower
+        if entry.upper < gamma: return entry.upper
+
+        # Let's not repeat positions. We don't chat
+        # - at the root (can_null=False) since it is in history, but not a draw.
+        # - at depth=0, since it would be expensive and break "futility pruning".
+        if can_null and depth > 0 and pos in self.history:
+            return 0
+
+        # Generator of moves to search in order.
+        # This allows us to define the moves, but only calculate them if needed.
+        def moves():
+            # First try not moving at all. We only do this if there is at least one major
+            # piece left on the board, since otherwise zugzwangs are too dangerous.
+            if depth > 2 and can_null and abs(pos.score) < 500:
+                yield None, -self.bound(pos.rotate(nullmove=True), 1 - gamma, depth - 3)
+
+            # For QSearch we have a different kind of null-move, namely we can just stop
+            # and not capture anything else.
+            if depth == 0:
+                yield None, pos.score
+
+            # Look for the strongest move from last time, the hash-move.
+            killer = self.tp_move.get(pos)
+
+            # If there isn't one, try to find one with a more shallow search.
+            # This is known as Internal Iterative Deepening (IID). We set
+            # can_null=True, since we want to make sure we actually find a move.
+            if not killer and depth > 2:
+                self.bound(pos, gamma, depth - 3, can_null=False)
+                killer = self.tp_move.get(pos)
+
+            # If depth == 0 we only try moves with high intrinsic score (captures and
+            # promotions). Otherwise we do all moves. This is called quiescent search.
+            val_lower = QS - depth * QS_A
+
+            # Only play the move if it would be included at the current val-limit,
+            # since otherwise we'd get search instability.
+            # We will search it again in the main loop below, but the tp will fix
+            # things for us.
+            if killer and pos.value(killer) >= val_lower:
+                yield killer, -self.bound(pos.move(killer), 1 - gamma, depth - 1)
+
+            # Then all the other moves
+            for val, move in sorted(((pos.value(m), m) for m in pos.gen_moves()), reverse=True):
+                # Quiescent search
+                if val < val_lower:
+                    break
+
+                # If the new score is less than gamma, the opponent will for sure just
+                # stand pat, since ""pos.score + val < gamma === -(pos.score + val) >= 1-gamma""
+                # This is known as futility pruning.
+                if depth <= 1 and pos.score + val < gamma:
+                    # Need special case for MATE, since it would normally be caught
+                    # before standing pat.
+                    yield move, pos.score + val if val < MATE_LOWER else MATE_UPPER
+                    # We can also break, since we have ordered the moves by value,
+                    # so it can't get any better than this.
+                    break
+
+                yield move, -self.bound(pos.move(move), 1 - gamma, depth - 1)
+
+        # Run through the moves, shortcutting when possible
+        best = -MATE_UPPER
+        for move, score in moves():
+            best = max(best, score)
+            if best >= gamma:
+                # Save the move for pv construction and killer heuristic
+                if move is not None:
+                    self.tp_move[pos] = move
+                break
+
+        # This is too expensive to test at depth == 0
+        if depth > 2 and best == -MATE_UPPER:
+            flipped = pos.rotate(nullmove=True)
+            # Hopefully this is already in the TT because of null-move
+            in_check = self.bound(flipped, MATE_UPPER, 0) == MATE_UPPER
+            best = -MATE_LOWER if in_check else 0
+
+        # Table part 2
+        if best >= gamma:
+            self.tp_score[pos, depth, can_null] = Entry(best, entry.upper)
+        if best < gamma:
+            self.tp_score[pos, depth, can_null] = Entry(entry.lower, best)
+
+        return best
+
+    def search(self, history):
+        """Iterative deepening MTD-bi search"""
+        self.nodes = 0
+        self.history = set(history)
+        self.tp_score.clear()
+
+        gamma = 0
+        # In finished games, we could potentially go far enough to cause a recursion
+        # limit exception. Hence we bound the ply. We also can't start at 0, since
+        # that's quiscent search, and we don't always play legal moves there.
+        for depth in range(1, 1000):
+            # The inner loop is a binary search on the score of the position.
+            # Inv: lower <= score <= upper
+            # 'while lower != upper' would work, but it's too much effort to spend
+            # on what's probably not going to change the move played.
+            lower, upper = -MATE_LOWER, MATE_LOWER
+            while lower < upper - EVAL_ROUGHNESS:
+                score = self.bound(history[-1], gamma, depth, can_null=False)
+                if score >= gamma:
+                    lower = score
+                if score < gamma:
+                    upper = score
+                yield depth, gamma, score, self.tp_move.get(history[-1])
+                gamma = (lower + upper + 1) // 2
